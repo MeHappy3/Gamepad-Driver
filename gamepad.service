@@ -1,0 +1,10 @@
+[Unit] 
+Description=Gamepad virtual driver 0
+After=network.target 
+
+[Service] 
+ExecStart=/usr/local/bin/gamepad_driver /usr/local/bin/gamepad.conf 
+Restart=always 
+
+[Install] 
+WantedBy=multi-user.target 
