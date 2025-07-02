@@ -18,7 +18,8 @@
 #define MAX_LINE 128
 #define CONFIG_PATH "gamepad.conf"
 #define ADC_MAX 2048
-#define UINPUT_AXIS_MAX 255
+#define UINPUT_AXIS_MAX 256
+#define ERROR 580
 
 // Supported buttons with names
 struct ButtonConfig {
@@ -32,7 +33,8 @@ int button_count = 0;
 
 int axis_channels[4] = {0, 4, 1, 5}; // LEFTX, LEFTY, RIGHTX, RIGHTY
 
-// Map name to uinput keycode
+int dpad_gpio[4] = {-1, -1, -1, -1}; // UP, DOWN, LEFT, RIGHT
+
 int map_button_name(const char *name) {
     if (strcmp(name, "A") == 0) return BTN_A;
     if (strcmp(name, "B") == 0) return BTN_B;
@@ -63,9 +65,7 @@ void load_config(const char *path) {
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), ff)) {
-        // Remove newline
         line[strcspn(line, "\r\n")] = 0;
-
         if (line[0] == '#' || line[0] == '[' || strlen(line) < 3)
             continue;
 
@@ -80,12 +80,18 @@ void load_config(const char *path) {
         if (keycode < 0) continue;
 
         int gpio = atoi(value);
-        strncpy(buttons[button_count].name, name, 31);
-        buttons[button_count].gpio = gpio;
-        buttons[button_count].keycode = keycode;
 
-        printf("Button %d (%s) = GPIO %d (keycode %d)\n", button_count, name, gpio, keycode);
-        button_count++;
+        if (strcmp(name, "DPAD_UP") == 0) dpad_gpio[0] = gpio;
+        else if (strcmp(name, "DPAD_DOWN") == 0) dpad_gpio[1] = gpio;
+        else if (strcmp(name, "DPAD_LEFT") == 0) dpad_gpio[2] = gpio;
+        else if (strcmp(name, "DPAD_RIGHT") == 0) dpad_gpio[3] = gpio;
+        else {
+            strncpy(buttons[button_count].name, name, 31);
+            buttons[button_count].gpio = gpio;
+            buttons[button_count].keycode = keycode;
+            printf("Button %d (%s) = GPIO %d (keycode %d)\n", button_count, name, gpio, keycode);
+            button_count++;
+        }
     }
 
     fclose(ff);
@@ -108,10 +114,6 @@ int export_gpio(int gpio) {
     write(fd, "in", 2);
     close(fd);
     return 0;
-
-
-
-
 }
 
 int read_gpio(int gpio) {
@@ -140,8 +142,10 @@ int read_adc(int fd, uint8_t channel) {
 }
 
 int scale_axis(int val, int invert) {
-    int scaled = (val * UINPUT_AXIS_MAX) / ADC_MAX;
-    return invert ? (UINPUT_AXIS_MAX - scaled) : scaled;
+	int scaled = (val * UINPUT_AXIS_MAX) / ADC_MAX;
+	if (val >ADC_MAX/2 - ERROR && val <ADC_MAX/2+ERROR)
+	scaled=UINPUT_AXIS_MAX/2;
+	return invert ? (UINPUT_AXIS_MAX - scaled) : scaled;
 }
 
 int main() {
@@ -155,6 +159,10 @@ int main() {
     for (int i = 0; i < button_count; ++i)
         export_gpio(buttons[i].gpio);
 
+    for (int i = 0; i < 4; ++i)
+        if (dpad_gpio[i] >= 0)
+            export_gpio(dpad_gpio[i]);
+
     int ufd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     ioctl(ufd, UI_SET_EVBIT, EV_KEY);
     ioctl(ufd, UI_SET_EVBIT, EV_ABS);
@@ -166,6 +174,8 @@ int main() {
     ioctl(ufd, UI_SET_ABSBIT, ABS_Y);
     ioctl(ufd, UI_SET_ABSBIT, ABS_RX);
     ioctl(ufd, UI_SET_ABSBIT, ABS_RY);
+    ioctl(ufd, UI_SET_ABSBIT, ABS_HAT0X);
+    ioctl(ufd, UI_SET_ABSBIT, ABS_HAT0Y);
 
     struct uinput_user_dev uidev = {0};
     snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "MAX186 Gamepad");
@@ -175,6 +185,10 @@ int main() {
 
     uidev.absmax[ABS_X] = uidev.absmax[ABS_Y] = UINPUT_AXIS_MAX;
     uidev.absmax[ABS_RX] = uidev.absmax[ABS_RY] = UINPUT_AXIS_MAX;
+    uidev.absmin[ABS_HAT0X] = -1;
+    uidev.absmax[ABS_HAT0X] = 1;
+    uidev.absmin[ABS_HAT0Y] = -1;
+    uidev.absmax[ABS_HAT0Y] = 1;
 
     write(ufd, &uidev, sizeof(uidev));
     ioctl(ufd, UI_DEV_CREATE);
@@ -195,10 +209,23 @@ int main() {
         ev.code = ABS_RX; ev.value = right_x; write(ufd, &ev, sizeof(ev));
         ev.code = ABS_RY; ev.value = right_y; write(ufd, &ev, sizeof(ev));
 
+        // DPad as ABS_HAT
+        int hat_x = 0, hat_y = 0;
+        if (dpad_gpio[2] >= 0 && read_gpio(dpad_gpio[2])) hat_x = -1;
+        if (dpad_gpio[3] >= 0 && read_gpio(dpad_gpio[3])) hat_x = 1;
+        if (dpad_gpio[0] >= 0 && read_gpio(dpad_gpio[0])) hat_y = -1;
+        if (dpad_gpio[1] >= 0 && read_gpio(dpad_gpio[1])) hat_y = 1;
+
+        ev.type = EV_ABS;
+        ev.code = ABS_HAT0X; ev.value = hat_x; write(ufd, &ev, sizeof(ev));
+        ev.code = ABS_HAT0Y; ev.value = hat_y; write(ufd, &ev, sizeof(ev));
+
         for (int i = 0; i < button_count; ++i) {
             ev.type = EV_KEY;
             ev.code = buttons[i].keycode;
             ev.value = read_gpio(buttons[i].gpio);
+	    if(ev.code == BTN_THUMBL || ev.code == BTN_THUMBR)
+	    ev.value=(ev.value^1);
             write(ufd, &ev, sizeof(ev));
         }
 
